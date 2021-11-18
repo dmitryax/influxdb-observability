@@ -2,11 +2,11 @@ package store
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
-	"net/url"
+	"github.com/apache/arrow/go/arrow"
+	"github.com/apache/arrow/go/arrow/array"
+	influxdbiox "github.com/influxdata/influxdb-iox-client-go"
 	"time"
 
 	"github.com/hashicorp/go-hclog"
@@ -49,20 +49,33 @@ const (
 )
 
 type Store struct {
-	host     string
-	database string
-
-	httpClient *http.Client
+	ioxClient *influxdbiox.Client
 
 	logger hclog.Logger
 }
 
+var _ shared.StoragePlugin = (*Store)(nil)
+
 func NewStore(conf *config.Configuration, logger hclog.Logger) (*Store, error) {
+	ioxConfig := &influxdbiox.ClientConfig{
+		Address:  conf.Host,
+		Database: conf.Database,
+		// TODO: TLS config
+	}
+	ctx := context.Background()
+	if conf.Timeout > 0 {
+		var cancel func()
+		ctx, cancel = context.WithTimeout(ctx, conf.Timeout)
+		defer cancel()
+	}
+	ioxClient, err := influxdbiox.NewClient(ctx, ioxConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to InfluxDB/IOx: %w", err)
+	}
+
 	return &Store{
-		host:       conf.Host,
-		database:   conf.Database,
-		httpClient: &http.Client{Timeout: conf.Timeout},
-		logger:     logger,
+		ioxClient: ioxClient,
+		logger:    logger,
 	}, nil
 }
 
@@ -79,45 +92,45 @@ func (s *Store) SpanWriter() spanstore.Writer {
 }
 
 func (s *Store) executeQuery(ctx context.Context, query string, f func(record map[string]interface{}) error, params ...interface{}) error {
-	u, err := url.Parse(s.host)
-	if err != nil {
-		return err
-	}
-	u.Path = fmt.Sprintf("iox/api/v1/databases/%s/query", s.database)
-	q := make(url.Values) // TODO try POST and see if double quotes problem goes away
-	q.Add("q", fmt.Sprintf(query, params...))
-	q.Add("format", "json")
-	u.RawQuery = q.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), http.NoBody)
-	if err != nil {
-		return err
-	}
-
-	res, err := s.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	if res.StatusCode == 400 {
-		// TODO this is a hack
-		// 400 suggests "not found" as in "zero results"
-		return nil
-	}
-	if res.StatusCode/100 != 2 {
-		return fmt.Errorf("query status %s", res.Status)
-	}
-
-	var m []map[string]interface{}
-	decoder := json.NewDecoder(res.Body)
-	if err = decoder.Decode(&m); err != nil {
-		return err
-	}
-
-	for _, line := range m {
-		err = f(line)
-		if err != nil {
-			return err
-		}
-	}
+	//u, err := url.Parse(s.host)
+	//if err != nil {
+	//	return err
+	//}
+	//u.Path = fmt.Sprintf("iox/api/v1/databases/%s/query", s.database)
+	//q := make(url.Values) // TODO try POST and see if double quotes problem goes away
+	//q.Add("q", fmt.Sprintf(query, params...))
+	//q.Add("format", "json")
+	//u.RawQuery = q.Encode()
+	//req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), http.NoBody)
+	//if err != nil {
+	//	return err
+	//}
+	//
+	//res, err := s.httpClient.Do(req)
+	//if err != nil {
+	//	return err
+	//}
+	//if res.StatusCode == 400 {
+	//	// TODO this is a hack
+	//	// 400 suggests "not found" as in "zero results"
+	//	return nil
+	//}
+	//if res.StatusCode/100 != 2 {
+	//	return fmt.Errorf("query status %q", res.Status)
+	//}
+	//
+	//var m []map[string]interface{}
+	//decoder := json.NewDecoder(res.Body)
+	//if err = decoder.Decode(&m); err != nil {
+	//	return err
+	//}
+	//
+	//for _, line := range m {
+	//	err = f(line)
+	//	if err != nil {
+	//		return err
+	//	}
+	//}
 
 	return nil
 }
@@ -403,17 +416,36 @@ func recordToSpanRef(record map[string]interface{}) (model.TraceID, model.SpanID
 }
 
 func (s *Store) GetServices(ctx context.Context) ([]string, error) {
-	var services []string
-	f := func(record map[string]interface{}) error {
-		if serviceName, found := record[attributeServiceName]; found {
-			services = append(services, serviceName.(string))
-		}
-		return nil
-	}
-
-	err := s.executeQuery(ctx, queryGetServices, f)
+	req, err := s.ioxClient.PrepareQuery(ctx, "", queryGetServices)
 	if err != nil {
 		return nil, err
+	}
+
+	reader, err := req.Query(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Release()
+
+	var services []string
+	for reader.Next() {
+		record := reader.Record()
+		col := record.Column(0)
+		if col.DataType().ID() != arrow.STRING {
+			return nil, fmt.Errorf("expected column type %q, got %q", arrow.BinaryTypes.String.Name(), col.DataType().Name())
+		}
+		{
+			// Pre-allocate slice
+			newServices := make([]string, len(services), len(services)+col.Len())
+			copy(newServices, services)
+			services = newServices
+		}
+
+		typedCol := col.(*array.String)
+		for i := 0; i < col.Len(); i++ {
+			// TODO Do these values need to be copied out of the Flight buffer?
+			services = append(services, typedCol.Value(i))
+		}
 	}
 	return services, nil
 }
